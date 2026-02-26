@@ -2,6 +2,7 @@
 
 namespace App\AI\Tools;
 
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
 class ExtractPdfTextTool
@@ -17,13 +18,24 @@ class ExtractPdfTextTool
             throw new RuntimeException('Smalot PDF Parser is not installed (smalot/pdfparser)');
         }
 
+        Log::info('ExtractPdfTextTool.start', [
+            'path' => $path,
+        ]);
+
         $parser = new \Smalot\PdfParser\Parser();
         $pdf = $parser->parseFile($path);
         $text = $pdf->getText();
 
-        return [
+        $result = [
             'ok' => true,
             'text' => $text,
         ];
+
+        Log::info('ExtractPdfTextTool.success', [
+            'path' => $path,
+            'text_length' => is_string($text) ? mb_strlen($text) : null,
+        ]);
+
+        return $result;
     }
 }

@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 
@@ -75,6 +76,11 @@ class GmailService
         $query = $options['query'] ?? self::DEFAULT_QUERY;
         $pdfOnly = (bool) ($options['pdf_only'] ?? false);
 
+        Log::info('GmailService.fetchLatestEmail.start', [
+            'query' => $query,
+            'pdf_only' => $pdfOnly,
+        ]);
+
         $token = $this->refreshAccessToken()['access_token'];
 
         $listResp = Http::withToken($token)
@@ -89,6 +95,9 @@ class GmailService
 
         $messages = $listResp['messages'] ?? [];
         if (empty($messages)) {
+            Log::warning('GmailService.fetchLatestEmail.no_messages', [
+                'query' => $query,
+            ]);
             throw new RuntimeException('No messages found for query: ' . $query);
         }
 
@@ -100,7 +109,14 @@ class GmailService
             ->throw()
             ->json();
 
-        return $this->parseMessage($token, $messageId, $fullMessage, $pdfOnly);
+        $parsed = $this->parseMessage($token, $messageId, $fullMessage, $pdfOnly);
+
+        Log::info('GmailService.fetchLatestEmail.success', [
+            'message_id' => $messageId,
+            'attachments_count' => \count($parsed['attachments'] ?? []),
+        ]);
+
+        return $parsed;
     }
 
     /**
@@ -243,6 +259,12 @@ class GmailService
         $path = $dir . '/' . $unique;
 
         Storage::disk(self::ATTACHMENT_DISK)->put($path, $content);
+
+        Log::info('GmailService.storeAttachment', [
+            'message_id' => $messageId,
+            'path' => $path,
+            'mimeType' => $mimeType,
+        ]);
 
         return $path;
     }

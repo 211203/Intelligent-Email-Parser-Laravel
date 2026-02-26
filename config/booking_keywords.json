@@ -1,0 +1,46 @@
+{
+  "Sahil": {
+    "keywords": [
+      "channel name",
+      "booking id",
+      "booking status",
+      "check-in date",
+      "check-out date",
+      "guest name",
+      "payment status",
+      "room type",
+      "number of guests",
+      "guest phone number",
+      "guest email address",
+      "booking email address",
+      "booking phone number",
+      "daily amounts",
+      "commission amount",
+      "room total",
+      "total taxes",
+      "total amount"
+    ]
+  },
+  "soham": {
+    "keywords": [
+      "booking id",
+      "booking status",
+      "check-in date",
+      "check-out date",
+      "guest name",
+      "payment status",
+      "room type",
+      "number of guests",
+      "guest phone number",
+      "guest email address",
+      "booking email address",
+      "booking phone number",
+      "daily amounts",
+      "commission amount",
+      "room total",
+      "total taxes",
+      "total amount"
+    ]
+  }
+}
+

@@ -5,157 +5,208 @@ namespace App\AI\Agents;
 use App\AI\Tools\ExtractPdfTextTool;
 use App\AI\Tools\FetchGmailTool;
 use App\AI\Tools\ParseBookingDataTool;
-use App\AI\Tools\SaveBookingTool;
 use Illuminate\Http\Client\PendingRequest;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
-use Throwable;
 
 class BookingAgent
 {
-    /** @var array<string, object> */
+    /**
+     * @var array<string, object>
+     */
     private array $tools;
 
     public function __construct(
-        private readonly FetchGmailTool $fetchLatestEmailTool,
+        private readonly FetchGmailTool $fetchGmailTool,
         private readonly ExtractPdfTextTool $extractPdfTextTool,
         private readonly ParseBookingDataTool $parseBookingDataTool,
-        private readonly SaveBookingTool $saveBookingTool,
     ) {
         $this->tools = [
-            'fetch_latest_email' => $this->fetchLatestEmailTool,
+            'fetch_gmail' => $this->fetchGmailTool,
             'extract_pdf_text' => $this->extractPdfTextTool,
             'parse_booking_data' => $this->parseBookingDataTool,
-            'save_booking' => $this->saveBookingTool,
         ];
     }
 
     /**
-     * @param array{
-     *   pdf_path?: string|null,
-     *   client_name?: string|null
-     * } $context
      * @return array<string, mixed>
      */
-    public function run(array $context): array
+    public function run(?string $pdfPath, string $clientName): array
     {
-        $pdfPath = Arr::get($context, 'pdf_path');
-        $clientName = Arr::get($context, 'client_name');
-
         $messages = [
             [
                 'role' => 'system',
-                'content' => "You are a tool-using agent that processes booking emails or PDFs and returns strictly valid JSON. You must use tools to do work. Return final result as JSON with keys: booking, saved. booking is structured booking data. saved is save confirmation.",
+                'content' => implode("\n", [
+                    "You are a strict booking automation agent.",
+                    "",
+                    "You have access to the following tools:",
+                    "",
+                    "1) fetch_gmail",
+                    "   Input: { client_name: string }",
+                    "   Output: { ok: bool, pdf_path: string }",
+                    "",
+                    "2) extract_pdf_text",
+                    "   Input: { pdf_path: string }",
+                    "   Output: { ok: bool, text: string }",
+                    "",
+                    "3) parse_booking_data",
+                    "   Input: { text: string, client_name?: string }",
+                    "   Output: { structured booking JSON }",
+                    "",
+                    "Rules:",
+                    "- If pdf_path is null, you MUST first call fetch_gmail.",
+                    "- After you have a valid pdf_path, you MUST call extract_pdf_text.",
+                    "- After you receive text, you MUST call parse_booking_data.",
+                    "- Never skip steps.",
+                    "- Never invent a pdf_path.",
+                    "- Never modify tool output.",
+                    "- Your FINAL response MUST be ONLY the JSON returned from parse_booking_data.",
+                    "- Do NOT add explanations, markdown, or text outside JSON.",
+                ]),
             ],
             [
                 'role' => 'user',
                 'content' => json_encode([
-                    'instruction' => 'Process the latest booking content into structured JSON and save it.',
-                    'context' => [
-                        'has_pdf' => (bool) $pdfPath,
-                        'pdf_path' => $pdfPath,
-                        'client_name' => $clientName,
-                    ],
-                    'required_flow' => [
-                        'If has_pdf then call extract_pdf_text else call fetch_latest_email',
-                        'Then call parse_booking_data',
-                        'Then call save_booking',
-                        'Then provide final JSON response',
-                    ],
-                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                    'client_name' => $clientName,
+                    'pdf_path' => $pdfPath,
+                ], JSON_THROW_ON_ERROR),
             ],
         ];
-
-        $toolsSchema = $this->toolsSchema();
-
-        $pendingToolResult = null;
-        $maxSteps = 8;
-
-        for ($i = 0; $i < $maxSteps; $i++) {
-            $payload = [
-                'model' => env('GROQ_MODEL', 'llama-3.3-70b-versatile'),
-                'messages' => $messages,
-                'temperature' => 0,
-                'tools' => $toolsSchema,
-                'tool_choice' => 'auto',
+    
+        $tools = $this->toolSchemas();
+        $model = env('GROQ_MODEL', 'llama-3.3-70b-versatile');
+        $maxIterations = 6;
+    
+        for ($i = 0; $i < $maxIterations; $i++) {
+    
+            $response = $this->groqChat($model, $messages, $tools);
+    
+            $choice = $response['choices'][0]['message'] ?? null;
+            if (! is_array($choice)) {
+                throw new RuntimeException('AI response missing message payload');
+            }
+    
+            $messages[] = [
+                'role' => $choice['role'] ?? 'assistant',
+                'content' => $choice['content'] ?? '',
+                'tool_calls' => $choice['tool_calls'] ?? null,
             ];
-
-            $response = $this->groqHttp()
-                ->post('/openai/v1/chat/completions', $payload)
-                ->throw()
-                ->json();
-
-            $choice = $response['choices'][0] ?? null;
-            if (!$choice) {
-                throw new RuntimeException('Groq: missing choices');
-            }
-
-            $message = $choice['message'] ?? [];
-            $toolCalls = $message['tool_calls'] ?? [];
-
-            if (!empty($toolCalls)) {
-                $messages[] = [
-                    'role' => 'assistant',
-                    'content' => $message['content'] ?? null,
-                    'tool_calls' => $toolCalls,
-                ];
-
-                foreach ($toolCalls as $call) {
-                    $toolName = $call['function']['name'] ?? null;
-                    $toolArgsJson = $call['function']['arguments'] ?? '{}';
-                    $toolCallId = $call['id'] ?? null;
-
-                    if (!$toolName || !$toolCallId) {
-                        throw new RuntimeException('Groq: invalid tool call format');
-                    }
-
-                    $toolArgs = json_decode($toolArgsJson, true);
-                    if (!is_array($toolArgs)) {
-                        $toolArgs = [];
-                    }
-
-                    $result = $this->executeTool($toolName, $toolArgs);
-                    $pendingToolResult = $result;
-
-                    $messages[] = [
-                        'role' => 'tool',
-                        'tool_call_id' => $toolCallId,
-                        'content' => json_encode($result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-                    ];
+    
+            $toolCalls = $choice['tool_calls'] ?? null;
+    
+            // ✅ If no tool calls → final response expected
+            if (empty($toolCalls)) {
+    
+                $content = trim((string) ($choice['content'] ?? ''));
+    
+                if ($content === '') {
+                    throw new RuntimeException('Final AI response is empty');
                 }
-
-                continue;
+    
+                $decoded = json_decode($content, true);
+    
+                if (! is_array($decoded)) {
+                    Log::error('Final AI response not valid JSON', [
+                        'content' => $content
+                    ]);
+                    throw new RuntimeException('AI final response is not valid JSON');
+                }
+    
+                return $decoded;
             }
+    
+            foreach ($toolCalls as $toolCall) {
+    
+                $function = $toolCall['function'] ?? [];
+                $name = $function['name'] ?? null;
+                $argumentsJson = $function['arguments'] ?? '{}';
+    
+                if (! is_string($name) || $name === '') {
+                    throw new RuntimeException('Tool call missing function name');
+                }
+    
+                if (! isset($this->tools[$name])) {
+                    throw new RuntimeException("Unknown tool requested: {$name}");
+                }
+    
+                $args = json_decode((string) $argumentsJson, true);
+                if (! is_array($args)) {
+                    $args = [];
+                }
+    
+                // 🔐 Strict input validation
+                if ($name === 'extract_pdf_text' && empty($args['pdf_path'])) {
+                    throw new RuntimeException('extract_pdf_text called without pdf_path');
+                }
+    
+                if ($name === 'parse_booking_data' && empty($args['text'])) {
+                    throw new RuntimeException('parse_booking_data called without text');
+                }
+    
+                Log::info('BookingAgent.tool_call', [
+                    'tool' => $name,
+                    'args' => $args,
+                ]);
+    
+                $result = match ($name) {
+                    'fetch_gmail' =>
+                        $this->fetchGmailTool->handle(
+                            isset($args['client_name'])
+                                ? (string) $args['client_name']
+                                : $clientName
+                        ),
 
-            $content = $message['content'] ?? '';
-            $final = json_decode($content, true);
-            if (is_array($final)) {
-                return $final;
+                    'extract_pdf_text' =>
+                        $this->extractPdfTextTool->handle(
+                            (string) $args['pdf_path']
+                        ),
+
+                    'parse_booking_data' =>
+                        $this->parseBookingDataTool->handle(
+                            (string) $args['text'],
+                            isset($args['client_name'])
+                                ? (string) $args['client_name']
+                                : $clientName
+                        ),
+
+                    default =>
+                        throw new RuntimeException("Tool handler not implemented: {$name}")
+                };
+    
+                $messages[] = [
+                    'role' => 'tool',
+                    'tool_call_id' => $toolCall['id'] ?? '',
+                    'content' => json_encode($result),
+                ];
+    
+                Log::info('BookingAgent.tool_result', [
+                    'tool' => $name,
+                    'result_keys' => array_keys($result),
+                ]);
             }
-
-            if (is_array($pendingToolResult)) {
-                return $pendingToolResult;
-            }
-
-            throw new RuntimeException('Groq: expected final JSON response from agent');
         }
-
-        throw new RuntimeException('Agent exceeded max tool-calling steps');
+    
+        throw new RuntimeException('Tool-calling loop exceeded maximum iterations');
     }
 
-    /** @return array<int, array<string, mixed>> */
-    private function toolsSchema(): array
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    private function toolSchemas(): array
     {
         return [
             [
                 'type' => 'function',
                 'function' => [
-                    'name' => 'fetch_latest_email',
-                    'description' => 'Fetch latest Zoho email and return plain text content.',
+                    'name' => 'fetch_gmail',
+                    'description' => 'Fetch latest unread Gmail and return PDF path',
                     'parameters' => [
                         'type' => 'object',
-                        'properties' => [],
+                        'properties' => [
+                            'client_name' => ['type' => 'string'],
+                        ],
+                        'required' => ['client_name'],
                     ],
                 ],
             ],
@@ -163,13 +214,13 @@ class BookingAgent
                 'type' => 'function',
                 'function' => [
                     'name' => 'extract_pdf_text',
-                    'description' => 'Extract raw text from a PDF file at a given path.',
+                    'description' => 'Extract text from PDF path',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
-                            'path' => ['type' => 'string'],
+                            'pdf_path' => ['type' => 'string'],
                         ],
-                        'required' => ['path'],
+                        'required' => ['pdf_path'],
                     ],
                 ],
             ],
@@ -177,58 +228,42 @@ class BookingAgent
                 'type' => 'function',
                 'function' => [
                     'name' => 'parse_booking_data',
-                    'description' => 'Parse booking data from raw text and optional client_name.',
+                    'description' => 'Parse booking data from extracted text',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
                             'text' => ['type' => 'string'],
-                            'client_name' => ['type' => ['string', 'null']],
+                            'client_name' => ['type' => 'string'],
                         ],
                         'required' => ['text'],
-                    ],
-                ],
-            ],
-            [
-                'type' => 'function',
-                'function' => [
-                    'name' => 'save_booking',
-                    'description' => 'Persist a booking record into database.',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'booking' => ['type' => 'object'],
-                        ],
-                        'required' => ['booking'],
                     ],
                 ],
             ],
         ];
     }
 
-    /** @param array<string, mixed> $args */
-    private function executeTool(string $name, array $args): array
+    /**
+     * @param array<int, array<string, mixed>> $messages
+     * @param array<int, array<string, mixed>> $tools
+     * @return array<string, mixed>
+     */
+    private function groqChat(string $model, array $messages, array $tools): array
     {
-        if (!array_key_exists($name, $this->tools)) {
-            throw new RuntimeException("Unknown tool: {$name}");
+        $resp = $this->groqHttp()
+            ->post('/openai/v1/chat/completions', [
+                'model' => $model,
+                'messages' => $messages,
+                'tools' => $tools,
+            ])
+            ->throw()
+            ->json();
+
+        if (! is_array($resp)) {
+            throw new RuntimeException('Groq API did not return an array response');
         }
 
-        try {
-            return match ($name) {
-                'fetch_latest_email' => $this->fetchLatestEmailTool->handle(),
-                'extract_pdf_text' => $this->extractPdfTextTool->handle((string) ($args['path'] ?? '')),
-                'parse_booking_data' => $this->parseBookingDataTool->handle(
-                    (string) ($args['text'] ?? ''),
-                    Arr::get($args, 'client_name')
-                ),
-                'save_booking' => $this->saveBookingTool->handle((array) ($args['booking'] ?? [])),
-                default => throw new RuntimeException("Unknown tool: {$name}"),
-            };
-        } catch (Throwable $e) {
-            return [
-                'ok' => false,
-                'error' => $e->getMessage(),
-            ];
-        }
+        /** @var array<string, mixed> $resp */
+        return $resp;
     }
 
     private function groqHttp(): PendingRequest
