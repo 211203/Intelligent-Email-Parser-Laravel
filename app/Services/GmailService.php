@@ -71,6 +71,44 @@ class GmailService
         return $this->stripHtml($html);
     }
 
+    /**
+     * Fetch latest email with structured data for FetchGmailTool
+     * @return array{body_text?: string, body_html?: string, attachments?: array}
+     */
+    public function fetchLatestEmail(array $options = []): array
+    {
+        $mailFetchUrl = (string) env('MAIL_FETCH_URL');
+        if ($mailFetchUrl === '') {
+            throw new RuntimeException('Missing MAIL_FETCH_URL');
+        }
+
+        $token = $this->refreshAccessToken()['access_token'];
+
+        $resp = Http::withToken($token)
+            ->acceptJson()
+            ->timeout(60)
+            ->get($mailFetchUrl)
+            ->throw()
+            ->json();
+
+        $html = $resp['html'] ?? $resp['body'] ?? $resp['content'] ?? $resp['data']['html'] ?? null;
+        $text = $resp['text'] ?? $resp['plain'] ?? $resp['data']['text'] ?? null;
+
+        // Extract text content
+        $bodyText = '';
+        if (is_string($text) && $text !== '') {
+            $bodyText = $text;
+        } elseif (is_string($html) && $html !== '') {
+            $bodyText = $this->stripHtml($html);
+        }
+
+        return [
+            'body_text' => $bodyText,
+            'body_html' => $html,
+            'attachments' => $resp['attachments'] ?? [], // For future PDF support
+        ];
+    }
+
     private function stripHtml(string $html): string
     {
         $html = preg_replace('/<\s*br\s*\/?>/i', "\n", $html) ?? $html;

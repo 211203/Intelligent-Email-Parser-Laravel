@@ -23,3 +23,7 @@ Route::get('/simple/status', [SimpleProcessController::class, 'status']);
 // Gmail-first processing routes (what you requested)
 Route::post('/gmail-first', [GmailFirstController::class, 'process']);
 Route::get('/gmail-first/status', [GmailFirstController::class, 'status']);
+
+// Gmail authentication routes (NEW - Real Gmail API)
+Route::get('/gmail/auth', [GmailFirstController::class, 'authUrl']);
+Route::get('/gmail/callback', [GmailFirstController::class, 'callback']);

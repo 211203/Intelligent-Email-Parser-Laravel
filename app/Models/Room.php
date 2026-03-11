@@ -14,11 +14,13 @@ class Room extends Model
         'max_occupancy',
         'total_rooms',
         'is_active',
+        'facilities',
     ];
 
     protected $casts = [
         'base_price' => 'decimal:2',
         'is_active' => 'boolean',
+        'facilities' => 'array',
     ];
 
     public function inventories(): HasMany

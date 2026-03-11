@@ -2,102 +2,82 @@
 
 namespace App\AI\Tools;
 
-use Illuminate\Http\Client\PendingRequest;
-use Illuminate\Support\Facades\Http;
-use RuntimeException;
+use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Laravel\Ai\Contracts\Tool;
+use Laravel\Ai\Tools\Request;
+use Stringable;
 
-class DetectInputTypeTool
+class DetectInputTypeTool implements Tool
 {
-    /**
-     * @return array{ok: bool, type: string}
-     */
-    public function handle(string $emailContent): array
+    public function name(): string
     {
-        $prompt = $this->buildPrompt($emailContent);
-        
-        $response = $this->groqHttp()
-            ->post('/openai/v1/chat/completions', [
-                'model' => env('GROQ_MODEL', 'llama-3.3-70b-versatile'),
-                'messages' => [
-                    ['role' => 'system', 'content' => 'Return only valid JSON. Do not wrap in markdown.'],
-                    ['role' => 'user', 'content' => $prompt],
-                ],
-                'temperature' => 0,
-            ])
-            ->throw()
-            ->json();
+        return 'detect_input_type';
+    }
 
-        $content = $response['choices'][0]['message']['content'] ?? '';
-        if (!is_string($content) || trim($content) === '') {
-            throw new RuntimeException('DetectInputTypeTool returned empty content');
-        }
+    public function description(): Stringable|string
+    {
+        return 'Detect whether email content is a booking confirmation or an inquiry using keyword analysis. Returns "booking" or "inquiry". Input: email_content (string, required).';
+    }
 
-        $data = $this->decodeJson($content);
-        
-        if (!isset($data['type']) || !in_array($data['type'], ['booking', 'inquiry'])) {
-            throw new RuntimeException('Invalid type returned from DetectInputTypeTool');
-        }
+    public function schema(JsonSchema $schema): array
+    {
+        return [];
+    }
 
-        return [
-            'ok' => true,
-            'type' => $data['type'],
+    public function handle(Request $request): Stringable|string
+    {
+        $emailContent = (string) ($request['email_content'] ?? '');
+        $type = $this->detect($emailContent);
+
+        return json_encode(['ok' => true, 'type' => $type]);
+    }
+
+    /**
+     * @return 'booking'|'inquiry'
+     */
+    private function detect(string $emailContent): string
+    {
+        $text = strtolower($emailContent);
+        $text = preg_replace('/\s+/', ' ', $text) ?? $text;
+
+        $bookingPhrases = [
+            'booking confirmation', 'reservation confirmed', 'confirmed reservation',
+            'confirmation number', 'booking id', 'reservation id',
+            'invoice', 'receipt', 'paid', 'payment received',
+            'booking reference', 'booking voucher',
         ];
-    }
 
-    private function buildPrompt(string $emailContent): string
-    {
-        return "Analyze the following email content and determine if it's a booking confirmation/invoice or an inquiry.
+        $inquiryPhrases = [
+            'availability', 'available', 'do you have', 'is there',
+            'please let me know', 'could you', 'can you',
+            'pricing', 'price', 'rate', 'tariff',
+            'quotation', 'quote', 'how much', 'cost',
+            'check in', 'check-in', 'looking for', 'interested in',
+            'would like to book', 'wish to book', 'planning',
+        ];
 
-Return JSON with exactly:
-{
-  \"type\": \"booking\" | \"inquiry\"
-}
-
-Rules:
-- \"booking\": Contains booking confirmation, invoice, reservation details, payment info, booking ID
-- \"inquiry\": Contains questions about availability, pricing, room information, requests for information
-
-Email content:
-" . $emailContent;
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    private function decodeJson(string $content): array
-    {
-        $trimmed = trim($content);
-
-        $trimmed = preg_replace('/^```(?:json)?\s*/i', '', $trimmed) ?? $trimmed;
-        $trimmed = preg_replace('/\s*```$/', '', $trimmed) ?? $trimmed;
-
-        $first = strpos($trimmed, '{');
-        $last = strrpos($trimmed, '}');
-        if ($first !== false && $last !== false && $last > $first) {
-            $trimmed = substr($trimmed, $first, $last - $first + 1);
+        $bookingScore = 0;
+        foreach ($bookingPhrases as $p) {
+            if (str_contains($text, $p)) {
+                $bookingScore++;
+            }
         }
 
-        $decoded = json_decode($trimmed, true);
-        if (is_array($decoded)) {
-            return $decoded;
+        $inquiryScore = 0;
+        foreach ($inquiryPhrases as $p) {
+            if (str_contains($text, $p)) {
+                $inquiryScore++;
+            }
         }
 
-        throw new RuntimeException('Unable to decode JSON from DetectInputTypeTool response');
-    }
-
-    private function groqHttp(): PendingRequest
-    {
-        $baseUrl = rtrim((string) env('GROQ_BASE_URL', 'https://api.groq.com'), '/');
-        $apiKey = (string) env('GROQ_API_KEY');
-
-        if ($apiKey === '') {
-            throw new RuntimeException('Missing GROQ_API_KEY');
+        if (str_contains($text, 'attach') && $bookingScore >= 1) {
+            return 'booking';
         }
 
-        return Http::baseUrl($baseUrl)
-            ->withToken($apiKey)
-            ->acceptJson()
-            ->asJson()
-            ->timeout(60);
+        if ($bookingScore > $inquiryScore) {
+            return 'booking';
+        }
+
+        return 'inquiry';
     }
 }

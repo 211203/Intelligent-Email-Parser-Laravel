@@ -1,0 +1,8 @@
+﻿
+  POST       api/gmail-first GmailFirstControlΓÇª
+  GET|HEAD   api/gmail-first/status GmailFirsΓÇª
+  GET|HEAD   api/gmail/auth GmailFirstControllΓÇª
+  GET|HEAD   api/gmail/callback GmailFirstContrΓÇª
+
+ Showing [4] routes
+

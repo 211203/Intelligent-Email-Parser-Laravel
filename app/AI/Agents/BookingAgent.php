@@ -2,389 +2,371 @@
 
 namespace App\AI\Agents;
 
-use App\AI\Tools\DetectInputTypeTool;
+use App\AI\Tools\CheckAvailabilityTool;
 use App\AI\Tools\ExtractPdfTextTool;
 use App\AI\Tools\FetchGmailTool;
+use App\AI\Tools\GenerateResponseTool;
 use App\AI\Tools\ParseBookingDataTool;
 use App\AI\Tools\ParseInquiryIntentTool;
+use App\AI\Tools\SaveBookingTool;
 use App\AI\Tools\SaveInquiryTool;
-use Illuminate\Http\Client\PendingRequest;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use RuntimeException;
+use Laravel\Ai\Tools\Request as ToolRequest;
+use Prism\Prism\Facades\Prism;
+use Prism\Prism\Tool as PrismTool;
 
 class BookingAgent
 {
-    /**
-     * @var array<string, object>
-     */
-    private array $tools;
-
-    public function __construct(
-        private readonly FetchGmailTool $fetchGmailTool,
-        private readonly ExtractPdfTextTool $extractPdfTextTool,
-        private readonly ParseBookingDataTool $parseBookingDataTool,
-        private readonly DetectInputTypeTool $detectInputTypeTool,
-        private readonly ParseInquiryIntentTool $parseInquiryIntentTool,
-        private readonly SaveInquiryTool $saveInquiryTool,
-    ) {
-        $this->tools = [
-            'fetch_gmail' => $this->fetchGmailTool,
-            'extract_pdf_text' => $this->extractPdfTextTool,
-            'detect_input_type' => $this->detectInputTypeTool,
-            'parse_booking_data' => $this->parseBookingDataTool,
-            'parse_inquiry_intent' => $this->parseInquiryIntentTool,
-            'save_inquiry' => $this->saveInquiryTool,
-        ];
-    }
+    private const MAX_RETRIES = 2;
 
     /**
-     * @return array<string, mixed>
+     * Collected results from each tool execution.
+     * These are captured during the Prism tool-calling loop.
      */
-    public function run(?string $pdfPath, string $clientName): array
+    private array $toolResults = [];
+
+    /**
+     * Process an email using Prism with Groq-compatible flat tool parameters.
+     * Returns a rich associative array with all extracted data, availability,
+     * pricing, and AI response — not just the LLM's summary text.
+     */
+    public function processEmail(string $prompt): array
     {
-        $messages = [
-            [
-                'role' => 'system',
-                'content' => implode("\n", [
-                    "You are a strict booking automation agent that handles both booking confirmations and inquiries.",
-                    "",
-                    "You have access to the following tools:",
-                    "",
-                    "1) fetch_gmail",
-                    "   Input: { client_name: string }",
-                    "   Output: { ok: bool, pdf_path: string }",
-                    "",
-                    "2) extract_pdf_text",
-                    "   Input: { pdf_path: string }",
-                    "   Output: { ok: bool, text: string }",
-                    "",
-                    "3) detect_input_type",
-                    "   Input: { email_content: string }",
-                    "   Output: { ok: bool, type: \"booking\" | \"inquiry\" }",
-                    "",
-                    "4) parse_booking_data",
-                    "   Input: { text: string, client_name?: string }",
-                    "   Output: { structured booking JSON }",
-                    "",
-                    "5) parse_inquiry_intent",
-                    "   Input: { text: string, client_name?: string }",
-                    "   Output: { structured inquiry JSON }",
-                    "",
-                    "6) save_inquiry",
-                    "   Input: { inquiry_data: object, source_type: string, client_name: string, raw_content?: string }",
-                    "   Output: { ok: bool, inquiry_id?: int, message?: string }",
-                    "",
-                    "Rules:",
-                    "- If pdf_path is null, you MUST first call fetch_gmail.",
-                    "- After you have a valid pdf_path, you MUST call extract_pdf_text.",
-                    "- After you receive text, you MUST call detect_input_type.",
-                    "- If type = \"booking\": call parse_booking_data then return booking JSON.",
-                    "- If type = \"inquiry\": call parse_inquiry_intent then save_inquiry then return inquiry JSON with inquiry_id.",
-                    "- Never skip steps.",
-                    "- Never invent a pdf_path.",
-                    "- Never modify tool output.",
-                    "- Your FINAL response MUST be ONLY the JSON returned from parse_booking_data OR parse_inquiry_intent (with inquiry_id).",
-                    "- Do NOT add explanations, markdown, or text outside JSON.",
-                ]),
-            ],
-            [
-                'role' => 'user',
-                'content' => json_encode([
-                    'client_name' => $clientName,
-                    'pdf_path' => $pdfPath,
-                ], JSON_THROW_ON_ERROR),
-            ],
-        ];
-    
-        $tools = $this->toolSchemas();
-        $model = env('GROQ_MODEL', 'llama-3.3-70b-versatile');
-        $maxIterations = 6;
-    
-        for ($i = 0; $i < $maxIterations; $i++) {
-    
-            $response = $this->groqChat($model, $messages, $tools);
-    
-            $choice = $response['choices'][0]['message'] ?? null;
-            if (! is_array($choice)) {
-                throw new RuntimeException('AI response missing message payload');
-            }
-    
-            $messages[] = [
-                'role' => $choice['role'] ?? 'assistant',
-                'content' => $choice['content'] ?? '',
-                'tool_calls' => $choice['tool_calls'] ?? null,
-            ];
-    
-            $toolCalls = $choice['tool_calls'] ?? null;
-    
-            // ✅ If no tool calls → final response expected
-            if (empty($toolCalls)) {
-    
-                $content = trim((string) ($choice['content'] ?? ''));
-    
-                if ($content === '') {
-                    throw new RuntimeException('Final AI response is empty');
-                }
-    
-                $decoded = json_decode($content, true);
-    
-                if (! is_array($decoded)) {
-                    Log::error('Final AI response not valid JSON', [
-                        'content' => $content
-                    ]);
-                    throw new RuntimeException('AI final response is not valid JSON');
-                }
-    
-                return $decoded;
-            }
-    
-            foreach ($toolCalls as $toolCall) {
-    
-                $function = $toolCall['function'] ?? [];
-                $name = $function['name'] ?? null;
-                $argumentsJson = $function['arguments'] ?? '{}';
-    
-                if (! is_string($name) || $name === '') {
-                    throw new RuntimeException('Tool call missing function name');
-                }
-    
-                if (! isset($this->tools[$name])) {
-                    throw new RuntimeException("Unknown tool requested: {$name}");
-                }
-    
-                $args = json_decode((string) $argumentsJson, true);
-                if (! is_array($args)) {
-                    $args = [];
-                }
-    
-                // 🔐 Strict input validation
-                if ($name === 'extract_pdf_text' && empty($args['pdf_path'])) {
-                    throw new RuntimeException('extract_pdf_text called without pdf_path');
-                }
+        Log::info('BookingAgent.processEmail', ['prompt_length' => strlen($prompt)]);
 
-                if ($name === 'detect_input_type' && empty($args['email_content'])) {
-                    throw new RuntimeException('detect_input_type called without email_content');
-                }
+        $this->toolResults = [];
+        $lastError = null;
 
-                if ($name === 'parse_booking_data' && empty($args['text'])) {
-                    throw new RuntimeException('parse_booking_data called without text');
-                }
+        for ($attempt = 1; $attempt <= self::MAX_RETRIES; $attempt++) {
+            try {
+                $response = Prism::text()
+                    ->using('groq', 'llama-3.3-70b-versatile')
+                    ->withSystemPrompt($this->instructions())
+                    ->withTools($this->buildTools())
+                    ->withMaxSteps(8)
+                    ->withPrompt($prompt)
+                    ->asText();
 
-                if ($name === 'parse_inquiry_intent' && empty($args['text'])) {
-                    throw new RuntimeException('parse_inquiry_intent called without text');
-                }
-
-                if ($name === 'save_inquiry' && empty($args['inquiry_data'])) {
-                    throw new RuntimeException('save_inquiry called without inquiry_data');
-                }
-    
-                Log::info('BookingAgent.tool_call', [
-                    'tool' => $name,
-                    'args' => $args,
+                Log::info('BookingAgent.processEmail.complete', [
+                    'attempt' => $attempt,
+                    'steps' => count($response->steps),
+                    'tools_executed' => array_keys($this->toolResults),
                 ]);
-    
-                $result = match ($name) {
-                    'fetch_gmail' =>
-                        $this->fetchGmailTool->handle(
-                            isset($args['client_name'])
-                                ? (string) $args['client_name']
-                                : $clientName
-                        ),
 
-                    'extract_pdf_text' =>
-                        $this->extractPdfTextTool->handle(
-                            (string) $args['pdf_path']
-                        ),
+                return $this->buildResponse();
 
-                    'detect_input_type' =>
-                        $this->detectInputTypeTool->handle(
-                            (string) $args['email_content']
-                        ),
-
-                    'parse_booking_data' =>
-                        $this->parseBookingDataTool->handle(
-                            (string) $args['text'],
-                            isset($args['client_name'])
-                                ? (string) $args['client_name']
-                                : $clientName
-                        ),
-
-                    'parse_inquiry_intent' =>
-                        $this->parseInquiryIntentTool->handle(
-                            (string) $args['text'],
-                            isset($args['client_name'])
-                                ? (string) $args['client_name']
-                                : $clientName
-                        ),
-
-                    'save_inquiry' =>
-                        $this->saveInquiryTool->handle(
-                            $args['inquiry_data'],
-                            isset($args['source_type'])
-                                ? (string) $args['source_type']
-                                : 'email',
-                            isset($args['client_name'])
-                                ? (string) $args['client_name']
-                                : $clientName,
-                            $args['raw_content'] ?? null
-                        ),
-
-                    default =>
-                        throw new RuntimeException("Tool handler not implemented: {$name}")
-                };
-    
-                $messages[] = [
-                    'role' => 'tool',
-                    'tool_call_id' => $toolCall['id'] ?? '',
-                    'content' => json_encode($result),
-                ];
-    
-                Log::info('BookingAgent.tool_result', [
-                    'tool' => $name,
-                    'result_keys' => array_keys($result),
+            } catch (\Throwable $e) {
+                $lastError = $e;
+                Log::warning('BookingAgent.processEmail.retry', [
+                    'attempt' => $attempt,
+                    'error' => $e->getMessage(),
                 ]);
+
+                // Only retry on model-side generation failures
+                if (!str_contains($e->getMessage(), 'Failed to call a function')
+                    && !str_contains($e->getMessage(), 'failed_generation')) {
+                    throw $e;
+                }
             }
         }
-    
-        throw new RuntimeException('Tool-calling loop exceeded maximum iterations');
+
+        throw $lastError;
     }
 
     /**
-     * @return array<int, array<string, mixed>>
+     * Build a rich structured response from the captured tool results.
      */
-    private function toolSchemas(): array
+    private function buildResponse(): array
+    {
+        $emailData   = $this->toolResults['fetch_email'] ?? null;
+        $parseData   = $this->toolResults['classify_and_parse'] ?? null;
+        $bookingData = $this->toolResults['save_booking'] ?? null;
+        $inquiryData = $this->toolResults['handle_inquiry'] ?? null;
+
+        $type = $parseData['type'] ?? 'unknown';
+
+        $response = [
+            'success' => true,
+            'email_type' => $type,
+            'email_fetched' => ($emailData['ok'] ?? false),
+        ];
+
+        // Include extracted/parsed fields
+        if ($parseData) {
+            $response['extracted_fields'] = $parseData['parsed_data'] ?? [];
+        }
+
+        // Inquiry-specific: availability, pricing, AI response
+        if ($type === 'inquiry' && $inquiryData) {
+            $response['inquiry'] = [
+                'inquiry_id' => $inquiryData['inquiry_id'] ?? null,
+                'has_availability' => $inquiryData['has_availability'] ?? false,
+                'available_rooms' => $inquiryData['available_rooms'] ?? [],
+                'pricing' => $inquiryData['pricing'] ?? [],
+                'ai_response' => $inquiryData['response_text'] ?? null,
+            ];
+        }
+
+        // Booking-specific
+        if ($type === 'booking' && $bookingData) {
+            $response['booking'] = [
+                'saved' => $bookingData['ok'] ?? false,
+                'booking_db_id' => $bookingData['id'] ?? null,
+            ];
+        }
+
+        return $response;
+    }
+
+    /* ------------------------------------------------------------------
+     *  System instructions
+     * ----------------------------------------------------------------*/
+
+    private function instructions(): string
+    {
+        return <<<'PROMPT'
+You are a hotel booking assistant that processes emails step by step using tools.
+
+WORKFLOW:
+1. Call `fetch_email` to get the email content for the client.
+2. Call `classify_and_parse` with the email text to determine type and extract data.
+3. Based on the type returned:
+   - If "booking": Call `save_booking` with the parsed booking data JSON string.
+   - If "inquiry": Call `handle_inquiry` with the parsed inquiry data, client name, and email text.
+4. Return a short confirmation message.
+
+RULES:
+- Always start with `fetch_email` unless email content is already in the prompt.
+- If content is already provided, skip to `classify_and_parse`.
+- Use exact tool outputs — never fabricate data.
+- When a tool returns JSON, pass it forward as-is.
+PROMPT;
+    }
+
+    /* ------------------------------------------------------------------
+     *  Tool definitions (4 consolidated)
+     * ----------------------------------------------------------------*/
+
+    private function buildTools(): array
     {
         return [
-            [
-                'type' => 'function',
-                'function' => [
-                    'name' => 'fetch_gmail',
-                    'description' => 'Fetch latest unread Gmail and return PDF path',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'client_name' => ['type' => 'string'],
-                        ],
-                        'required' => ['client_name'],
-                    ],
-                ],
-            ],
-            [
-                'type' => 'function',
-                'function' => [
-                    'name' => 'extract_pdf_text',
-                    'description' => 'Extract text from PDF path',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'pdf_path' => ['type' => 'string'],
-                        ],
-                        'required' => ['pdf_path'],
-                    ],
-                ],
-            ],
-            [
-                'type' => 'function',
-                'function' => [
-                    'name' => 'detect_input_type',
-                    'description' => 'Detect if email content is booking or inquiry',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'email_content' => ['type' => 'string'],
-                        ],
-                        'required' => ['email_content'],
-                    ],
-                ],
-            ],
-            [
-                'type' => 'function',
-                'function' => [
-                    'name' => 'parse_booking_data',
-                    'description' => 'Parse booking data from extracted text',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'text' => ['type' => 'string'],
-                            'client_name' => ['type' => 'string'],
-                        ],
-                        'required' => ['text'],
-                    ],
-                ],
-            ],
-            [
-                'type' => 'function',
-                'function' => [
-                    'name' => 'parse_inquiry_intent',
-                    'description' => 'Parse inquiry intent and details from text',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'text' => ['type' => 'string'],
-                            'client_name' => ['type' => 'string'],
-                        ],
-                        'required' => ['text'],
-                    ],
-                ],
-            ],
-            [
-                'type' => 'function',
-                'function' => [
-                    'name' => 'save_inquiry',
-                    'description' => 'Save inquiry data to database',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'inquiry_data' => ['type' => 'object'],
-                            'source_type' => ['type' => 'string'],
-                            'client_name' => ['type' => 'string'],
-                            'raw_content' => ['type' => 'string'],
-                        ],
-                        'required' => ['inquiry_data', 'source_type', 'client_name'],
-                    ],
-                ],
-            ],
+            $this->buildFetchEmailTool(),
+            $this->buildClassifyAndParseTool(),
+            $this->buildSaveBookingTool(),
+            $this->buildHandleInquiryTool(),
         ];
     }
 
     /**
-     * @param array<int, array<string, mixed>> $messages
-     * @param array<int, array<string, mixed>> $tools
-     * @return array<string, mixed>
+     * Tool 1 — Fetch email (+ auto-extract PDF).
      */
-    private function groqChat(string $model, array $messages, array $tools): array
+    private function buildFetchEmailTool(): PrismTool
     {
-        $resp = $this->groqHttp()
-            ->post('/openai/v1/chat/completions', [
-                'model' => $model,
-                'messages' => $messages,
-                'tools' => $tools,
-            ])
-            ->throw()
-            ->json();
+        return (new PrismTool)
+            ->as('fetch_email')
+            ->for('Fetch the latest unread email from Gmail for a client. Returns email text and PDF text if an attachment was found.')
+            ->withStringParameter('client_name', 'The client name to fetch emails for')
+            ->using(function (string $client_name): string {
+                Log::info('Tool:fetch_email', ['client_name' => $client_name]);
 
-        if (! is_array($resp)) {
-            throw new RuntimeException('Groq API did not return an array response');
-        }
+                $emailResult = json_decode(
+                    (string) app(FetchGmailTool::class)->handle(new ToolRequest(['client_name' => $client_name])),
+                    true
+                );
 
-        /** @var array<string, mixed> $resp */
-        return $resp;
+                if (!($emailResult['ok'] ?? false)) {
+                    $out = ['ok' => false, 'error' => $emailResult['error'] ?? 'Failed to fetch email'];
+                    $this->toolResults['fetch_email'] = $out;
+                    return json_encode($out);
+                }
+
+                $content = $emailResult['email_content'] ?? '';
+                $pdfPath = $emailResult['pdf_path'] ?? null;
+
+                if ($pdfPath) {
+                    $pdfResult = json_decode(
+                        (string) app(ExtractPdfTextTool::class)->handle(new ToolRequest(['pdf_path' => $pdfPath])),
+                        true
+                    );
+                    if ($pdfResult['ok'] ?? false) {
+                        $content .= "\n\n--- PDF ATTACHMENT ---\n" . ($pdfResult['text'] ?? '');
+                    }
+                }
+
+                $out = ['ok' => true, 'email_content' => $content, 'has_pdf' => $pdfPath !== null];
+                $this->toolResults['fetch_email'] = $out;
+                return json_encode($out);
+            });
+    }
+                            
+    /**
+     * Tool 2 — Classify email type & parse content.
+     */
+    private function buildClassifyAndParseTool(): PrismTool
+    {
+        return (new PrismTool)
+            ->as('classify_and_parse')
+            ->for('Classify the email as "booking" or "inquiry" and extract structured data. Returns the type and parsed data.')
+            ->withStringParameter('email_content', 'The full email text to classify and parse')
+            ->withStringParameter('client_name', 'The client name', required: false)
+            ->using(function (string $email_content, string $client_name = ''): string {
+                Log::info('Tool:classify_and_parse', ['content_length' => strlen($email_content)]);
+
+                $type = $this->detectType($email_content);
+
+                if ($type === 'booking') {
+                    $parsed = json_decode(
+                        (string) app(ParseBookingDataTool::class)->handle(
+                            new ToolRequest(['text' => $email_content, 'client_name' => $client_name ?: null])
+                        ),
+                        true
+                    );
+                    $out = ['ok' => true, 'type' => 'booking', 'parsed_data' => $parsed['booking'] ?? $parsed];
+                } else {
+                    $parsed = json_decode(
+                        (string) app(ParseInquiryIntentTool::class)->handle(
+                            new ToolRequest(['text' => $email_content, 'client_name' => $client_name ?: null])
+                        ),
+                        true
+                    );
+                    $out = ['ok' => true, 'type' => 'inquiry', 'parsed_data' => $parsed['inquiry'] ?? $parsed];
+                }
+
+                $this->toolResults['classify_and_parse'] = $out;
+                return json_encode($out);
+            });
     }
 
-    private function groqHttp(): PendingRequest
+    /**
+     * Tool 3 — Save a booking.
+     */
+    private function buildSaveBookingTool(): PrismTool
     {
-        $baseUrl = rtrim((string) env('GROQ_BASE_URL', 'https://api.groq.com'), '/');
-        $apiKey = (string) env('GROQ_API_KEY');
+        return (new PrismTool)
+            ->as('save_booking')
+            ->for('Save a parsed booking confirmation to the database. Pass the parsed booking data as a JSON string.')
+            ->withStringParameter('booking_data', 'JSON string containing guest_name, booking_id, dates, amounts')
+            ->using(function (string $booking_data): string {
+                Log::info('Tool:save_booking');
+                $result = (string) app(SaveBookingTool::class)->handle(
+                    new ToolRequest(['booking_data' => $booking_data])
+                );
+                $this->toolResults['save_booking'] = json_decode($result, true) ?? [];
+                return $result;
+            });
+    }
 
-        if ($apiKey === '') {
-            throw new RuntimeException('Missing GROQ_API_KEY');
+    /**
+     * Tool 4 — Handle inquiry end-to-end (save → availability → response).
+     */
+    private function buildHandleInquiryTool(): PrismTool
+    {
+        return (new PrismTool)
+            ->as('handle_inquiry')
+            ->for('Handle an inquiry: saves it, checks room availability, and generates a response email. Returns the full result.')
+            ->withStringParameter('inquiry_data', 'JSON string of parsed inquiry data')
+            ->withStringParameter('client_name', 'The client name')
+            ->withStringParameter('raw_email', 'The original raw email text', required: false)
+            ->using(function (string $inquiry_data, string $client_name, string $raw_email = ''): string {
+                Log::info('Tool:handle_inquiry', ['client_name' => $client_name]);
+
+                // Step 1: Save inquiry
+                $saveResult = json_decode(
+                    (string) app(SaveInquiryTool::class)->handle(new ToolRequest([
+                        'inquiry_data' => $inquiry_data,
+                        'source_type' => 'email',
+                        'client_name' => $client_name,
+                        'raw_content' => $raw_email ?: null,
+                    ])),
+                    true
+                );
+
+                if (!($saveResult['ok'] ?? false)) {
+                    $out = ['ok' => false, 'error' => $saveResult['error'] ?? 'Failed to save inquiry'];
+                    $this->toolResults['handle_inquiry'] = $out;
+                    return json_encode($out);
+                }
+
+                $inquiryId = $saveResult['inquiry_id'];
+
+                // Step 2: Check availability
+                $availResult = json_decode(
+                    (string) app(CheckAvailabilityTool::class)->handle(
+                        new ToolRequest(['inquiry_id' => $inquiryId])
+                    ),
+                    true
+                );
+
+                $availData = $availResult['data'] ?? [];
+
+                // Step 3: Generate response
+                $responseResult = json_decode(
+                    (string) app(GenerateResponseTool::class)->handle(new ToolRequest([
+                        'inquiry_id' => $inquiryId,
+                        'quote_data' => json_encode($availData),
+                    ])),
+                    true
+                );
+
+                $out = [
+                    'ok' => true,
+                    'inquiry_id' => $inquiryId,
+                    'has_availability' => $availData['has_availability'] ?? false,
+                    'available_rooms' => $availData['available_rooms'] ?? [],
+                    'pricing' => $availData['quotes'] ?? $availData['pricing'] ?? [],
+                    'response_text' => $responseResult['response_text'] ?? null,
+                ];
+
+                $this->toolResults['handle_inquiry'] = $out;
+                return json_encode($out);
+            });
+    }
+
+    /* ------------------------------------------------------------------
+     *  Keyword-based email type detection
+     * ----------------------------------------------------------------*/
+
+    private function detectType(string $emailContent): string
+    {
+        $text = strtolower(preg_replace('/\s+/', ' ', $emailContent) ?? $emailContent);
+
+        // Definitive phrases that immediately identify a booking
+        $strictBookingPhrases = [
+            'booking confirmation', 'reservation confirmation', 'reservation confirmed', 
+            'booking confirmed', 'status: confirmed', 'new reservation',
+        ];
+
+        foreach ($strictBookingPhrases as $p) {
+            if (str_contains($text, $p)) {
+                return 'booking';
+            }
         }
 
-        return Http::baseUrl($baseUrl)
-            ->withToken($apiKey)
-            ->acceptJson()
-            ->asJson()
-            ->timeout(60);
+        $bookingPhrases = [
+            'confirmation number', 'booking id', 'reservation id', 'invoice', 
+            'receipt', 'paid', 'payment received', 'booking reference', 'booking voucher',
+        ];
+        $inquiryPhrases = [
+            'availability', 'available', 'do you have', 'please let me know',
+            'pricing', 'price', 'rate', 'tariff', 'quotation', 'quote',
+            'how much', 'cost', 'looking for', 'interested in',
+            'would like to book', 'wish to book', 'planning',
+        ];
+
+        $b = 0;
+        foreach ($bookingPhrases as $p) {
+            if (str_contains($text, $p)) {
+                $b++;
+            }
+        }
+
+        $i = 0;
+        foreach ($inquiryPhrases as $p) {
+            if (str_contains($text, $p)) {
+                $i++;
+            }
+        }
+
+        return $b > $i ? 'booking' : 'inquiry';
     }
 }

@@ -2,75 +2,113 @@
 
 namespace App\Services;
 
-use Illuminate\Http\Client\PendingRequest;
-use Illuminate\Support\Facades\Http;
+use App\Helpers\EmailPreprocessor;
+use App\Traits\GroqRetryTrait;
+use Illuminate\Support\Arr;
 use RuntimeException;
 
 class InquiryParserService
 {
+    use GroqRetryTrait;
+
+    public function __construct(private readonly EmailPreprocessor $emailPreprocessor)
+    {
+    }
+
     /**
      * @return array<string, mixed>
      */
     public function parse(string $rawText, ?string $clientName = null): array
     {
-        $schema = [
-            'check_in_date' => 'string|null',
-            'check_out_date' => 'string|null',
-            'number_of_guests' => 'integer|null',
-            'number_of_rooms' => 'integer|null',
-            'room_type_requested' => 'string|null',
-            'intent_type' => 'string|required', // availability | pricing | reservation | general
-        ];
+        $text = $this->emailPreprocessor->preprocess($rawText);
+        $clientKey = strtolower($clientName ?? 'default');
+        
+        $schemaPath = storage_path('app/schemas/inquiry_schema.json');
+        $keywords = ['intent type', 'check-in date', 'number of guests']; // minimum fallback
+        
+        if (file_exists($schemaPath)) {
+            $schemaData = json_decode(file_get_contents($schemaPath), true);
+            if (isset($schemaData[$clientKey]['keywords'])) {
+                $keywords = $schemaData[$clientKey]['keywords'];
+            } elseif (isset($schemaData['default']['keywords'])) {
+                $keywords = $schemaData['default']['keywords'];
+            }
+        }
 
-        $expectedKeys = array_keys($schema);
-        $prompt = $this->buildPrompt($rawText, $clientName, $schema, $expectedKeys);
+        // Build a dynamic LLM schema description based on the keywords
+        $schema = [];
+        $requiredKeys = [];
+        foreach ($keywords as $kw) {
+            $schemaKey = str_replace([' ', '-'], '_', strtolower($kw));
+            $requiredKeys[] = $schemaKey;
+            
+            if (str_contains($schemaKey, 'date')) {
+                $schema[$schemaKey] = 'string|null (YYYY-MM-DD format)';
+            } elseif (str_contains($schemaKey, 'number')) {
+                $schema[$schemaKey] = 'number|null';
+            } elseif ($schemaKey === 'intent_type') {
+                $schema[$schemaKey] = '"availability"|"pricing"|"reservation"|"general"';
+            } else {
+                $schema[$schemaKey] = 'string|null';
+            }
+        }
 
-        $response = $this->groqHttp()
-            ->post('/openai/v1/chat/completions', [
-                'model' => env('GROQ_MODEL', 'llama-3.3-70b-versatile'),
-                'messages' => [
-                    ['role' => 'system', 'content' => 'Return only valid JSON. Do not wrap in markdown.'],
-                    ['role' => 'user', 'content' => $prompt],
-                ],
-                'temperature' => 0,
-            ])
-            ->throw()
-            ->json();
+        $prompt = $this->buildPrompt($text, $clientName, $schema, $requiredKeys);
 
-        $content = $response['choices'][0]['message']['content'] ?? '';
+        $resp = $this->groqWithRetry('/openai/v1/chat/completions', [
+            'model' => env('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+            'messages' => [
+                ['role' => 'system', 'content' => 'Return only valid JSON. Do not wrap in markdown.'],
+                ['role' => 'user', 'content' => $prompt],
+            ],
+            'temperature' => 0,
+        ]);
+
+        $content = Arr::get($resp, 'choices.0.message.content', '');
         if (!is_string($content) || trim($content) === '') {
-            throw new RuntimeException('InquiryParserService returned empty content');
+            throw new RuntimeException('Groq parser returned empty content');
         }
 
         $data = $this->decodePossiblyMalformedJson($content);
-        $data = $this->normalize($data);
+        
+        // Final normalization for specific intents if present
+        if (isset($data['intent_type']) && is_string($data['intent_type'])) {
+            $normalizedIntent = strtolower(trim($data['intent_type']));
+            $allowed = ['availability', 'pricing', 'reservation', 'general'];
+            $data['intent_type'] = in_array($normalizedIntent, $allowed, true) ? $normalizedIntent : 'general';
+        }
 
-        $this->validateRequiredShape($data, $expectedKeys);
+        // Ensure all requested keys exist
+        foreach ($requiredKeys as $key) {
+            if (!array_key_exists($key, $data)) {
+                $data[$key] = null; // Fill missing fields gracefully
+            }
+        }
 
         return $data;
     }
 
     /**
      * @param array<string, string> $schema
-     * @param array<int, string> $expectedKeys
+     * @param array<int, string> $requiredKeys
      */
-    private function buildPrompt(string $text, ?string $clientName, array $schema, array $expectedKeys): string
+    private function buildPrompt(string $text, ?string $clientName, array $schema, array $requiredKeys): string
     {
-        $clientLine = $clientName ? "Client name hint: {$clientName}\n" : '';
+        $keysList = implode(', ', $requiredKeys);
+        $currentDate = now()->toDateString();
+        $currentYear = now()->year;
+        $schemaJson = json_encode($schema);
 
-        return $clientLine
-            . "Extract inquiry information from the following text and output STRICT JSON only.\n"
-            . "Schema keys and types: " . json_encode($schema) . "\n"
-            . "Intent types: availability, pricing, reservation, general\n"
-            . "Rules:\n"
-            . "- Output a JSON object with exactly these keys: " . implode(', ', $expectedKeys) . "\n"
-            . "- Use null if a field is missing\n"
-            . "- Dates must be ISO format YYYY-MM-DD if possible, else keep original string\n"
-            . "- number_of_guests and number_of_rooms must be integers if possible, else null\n"
-            . "- intent_type is required and must be one of: availability, pricing, reservation, general\n"
-            . "- room_type_requested: standard, deluxe, suite, etc.\n"
-            . "Text:\n"
-            . $text;
+        $prompt = "Extract hotel inquiry details as JSON.\n"
+            . "Keys: {$keysList}\n"
+            . "Types: {$schemaJson}\n"
+            . "Today: {$currentDate}. Default year: {$currentYear}. Dates MUST BE YYYY-MM-DD format. intent_type MUST be: availability, pricing, reservation, or general.\n"
+            . "CRITICAL RULE 1: If text contains partial dates like '15th July to 17th July' or 'tomorrow', YOU MUST infer the year/month/day using Today's date and return exact 'YYYY-MM-DD'. Do NOT return null if any date hint is mentioned.\n"
+            . "CRITICAL RULE 2: If the guest asks what rooms are available (e.g., 'share the room categories available'), intent_type MUST be 'availability'.\n"
+            . ($clientName ? "Client: {$clientName}\n" : '')
+            . "Text:\n{$text}";
+
+        return $prompt;
     }
 
     /**
@@ -102,69 +140,7 @@ class InquiryParserService
             return $decoded;
         }
 
-        throw new RuntimeException('Unable to decode JSON from InquiryParserService response');
+        throw new RuntimeException('Unable to decode JSON from Groq response');
     }
 
-    /**
-     * @param array<string, mixed> $data
-     * @return array<string, mixed>
-     */
-    private function normalize(array $data): array
-    {
-        // Normalize number_of_guests
-        $guests = $data['number_of_guests'] ?? null;
-        if (is_string($guests)) {
-            $normalized = preg_replace('/[^0-9]/', '', $guests) ?? '';
-            $data['number_of_guests'] = $normalized === '' ? null : (int) $normalized;
-        }
-
-        // Normalize number_of_rooms
-        $rooms = $data['number_of_rooms'] ?? null;
-        if (is_string($rooms)) {
-            $normalized = preg_replace('/[^0-9]/', '', $rooms) ?? '';
-            $data['number_of_rooms'] = $normalized === '' ? null : (int) $normalized;
-        }
-
-        // Normalize intent_type to lowercase
-        if (isset($data['intent_type']) && is_string($data['intent_type'])) {
-            $data['intent_type'] = strtolower($data['intent_type']);
-        }
-
-        return $data;
-    }
-
-    /**
-     * @param array<string, mixed> $data
-     * @param array<int, string> $keys
-     */
-    private function validateRequiredShape(array $data, array $keys): void
-    {
-        foreach ($keys as $key) {
-            if (!array_key_exists($key, $data)) {
-                throw new RuntimeException("Missing key in parsed inquiry JSON: {$key}");
-            }
-        }
-
-        // Validate intent_type specifically
-        $validIntents = ['availability', 'pricing', 'reservation', 'general'];
-        if (!in_array($data['intent_type'], $validIntents)) {
-            throw new RuntimeException("Invalid intent_type: {$data['intent_type']}. Must be one of: " . implode(', ', $validIntents));
-        }
-    }
-
-    private function groqHttp(): PendingRequest
-    {
-        $baseUrl = rtrim((string) env('GROQ_BASE_URL', 'https://api.groq.com'), '/');
-        $apiKey = (string) env('GROQ_API_KEY');
-
-        if ($apiKey === '') {
-            throw new RuntimeException('Missing GROQ_API_KEY');
-        }
-
-        return Http::baseUrl($baseUrl)
-            ->withToken($apiKey)
-            ->acceptJson()
-            ->asJson()
-            ->timeout(60);
-    }
 }

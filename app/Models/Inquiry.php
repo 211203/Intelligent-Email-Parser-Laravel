@@ -24,6 +24,7 @@ class Inquiry extends Model
         'intent_type',
         'raw_content',
         'parsed_json',
+        'ai_response',
     ];
 
     protected $casts = [

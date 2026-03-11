@@ -20,18 +20,37 @@ class BookingParserService
     public function parse(string $rawText, ?string $clientName = null): array
     {
         $text = $this->emailPreprocessor->preprocess($rawText);
+        $clientKey = strtolower($clientName ?? 'default');
+        
+        $schemaPath = storage_path('app/schemas/booking_schema.json');
+        $keywords = ['guest_name', 'booking_id', 'total_amount']; // minimum fallback
+        
+        if (file_exists($schemaPath)) {
+            $schemaData = json_decode(file_get_contents($schemaPath), true);
+            if (isset($schemaData[$clientKey]['keywords'])) {
+                $keywords = $schemaData[$clientKey]['keywords'];
+            } elseif (isset($schemaData['default']['keywords'])) {
+                $keywords = $schemaData['default']['keywords'];
+            }
+        }
 
-        $schema = [
-            'guest_name' => 'string|null',
-            'booking_id' => 'string|null',
-            'check_in_date' => 'string|null',
-            'check_out_date' => 'string|null',
-            'guest_email' => 'string|null',
-            'guest_phone' => 'string|null',
-            'total_amount' => 'number|null',
-        ];
+        // Build a dynamic LLM schema description based on the keywords
+        $schema = [];
+        $requiredKeys = [];
+        foreach ($keywords as $kw) {
+            $schemaKey = str_replace([' ', '-'], '_', strtolower($kw));
+            $requiredKeys[] = $schemaKey;
+            
+            if (str_contains($schemaKey, 'date')) {
+                $schema[$schemaKey] = 'string|null (YYYY-MM-DD format)';
+            } elseif (str_contains($schemaKey, 'amount') || str_contains($schemaKey, 'total') || str_contains($schemaKey, 'number')) {
+                $schema[$schemaKey] = 'number|null';
+            } else {
+                $schema[$schemaKey] = 'string|null';
+            }
+        }
 
-        $prompt = $this->buildPrompt($text, $clientName, $schema);
+        $prompt = $this->buildPrompt($text, $clientName, $schema, $requiredKeys);
 
         $resp = $this->groqHttp()
             ->post('/openai/v1/chat/completions', [
@@ -51,29 +70,35 @@ class BookingParserService
         }
 
         $data = $this->decodePossiblyMalformedJson($content);
-        $data = $this->normalize($data);
-
-        $this->validateRequiredShape($data);
+        
+        // Ensure all requested keys exist
+        foreach ($requiredKeys as $key) {
+            if (!array_key_exists($key, $data)) {
+                $data[$key] = null; // Fill missing fields gracefully
+            }
+        }
 
         return $data;
     }
 
     /**
      * @param array<string, string> $schema
+     * @param array<int, string> $requiredKeys
      */
-    private function buildPrompt(string $text, ?string $clientName, array $schema): string
+    private function buildPrompt(string $text, ?string $clientName, array $schema, array $requiredKeys): string
     {
         $clientLine = $clientName ? "Client name hint: {$clientName}\n" : '';
+        $keysList = implode(', ', $requiredKeys);
 
         return $clientLine
             . "Extract booking information from the following text and output STRICT JSON only.\n"
-            . "Schema keys and types: " . json_encode($schema) . "\n"
+            . "We need to extract specific fields defined by a custom schema.\n"
+            . "Schema keys and expected types: \n" . json_encode($schema, JSON_PRETTY_PRINT) . "\n"
             . "Rules:\n"
-            . "- Output JSON object with exactly these keys: guest_name, booking_id, check_in_date, check_out_date, guest_email, guest_phone, total_amount\n"
-            . "- Use null if a field is missing\n"
-            . "- Dates must be ISO format YYYY-MM-DD if possible, else keep original string\n"
-            . "- total_amount must be numeric if possible, else null\n"
-            . "- guest_phone should include country code if present, else keep digits\n"
+            . "- Output JSON object with exactly these keys: {$keysList}\n"
+            . "- Use null if a field is missing in the text.\n"
+            . "- Dates must be ISO format YYYY-MM-DD if possible, else keep original string.\n"
+            . "- Amounts/Totals must be numeric if possible, else null.\n"
             . "Text:\n"
             . $text;
     }
@@ -108,49 +133,6 @@ class BookingParserService
         }
 
         throw new RuntimeException('Unable to decode JSON from Groq response');
-    }
-
-    /**
-     * @param array<string, mixed> $data
-     * @return array<string, mixed>
-     */
-    private function normalize(array $data): array
-    {
-        $phone = Arr::get($data, 'guest_phone');
-        if (is_string($phone)) {
-            $digits = preg_replace('/[^0-9+]/', '', $phone) ?? $phone;
-            $data['guest_phone'] = $digits === '' ? null : $digits;
-        }
-
-        $amount = Arr::get($data, 'total_amount');
-        if (is_string($amount)) {
-            $normalized = preg_replace('/[^0-9.]/', '', $amount) ?? '';
-            $data['total_amount'] = $normalized === '' ? null : (float) $normalized;
-        }
-
-        return $data;
-    }
-
-    /**
-     * @param array<string, mixed> $data
-     */
-    private function validateRequiredShape(array $data): void
-    {
-        $keys = [
-            'guest_name',
-            'booking_id',
-            'check_in_date',
-            'check_out_date',
-            'guest_email',
-            'guest_phone',
-            'total_amount',
-        ];
-
-        foreach ($keys as $key) {
-            if (!array_key_exists($key, $data)) {
-                throw new RuntimeException("Missing key in parsed JSON: {$key}");
-            }
-        }
     }
 
     private function groqHttp(): PendingRequest

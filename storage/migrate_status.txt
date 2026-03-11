@@ -1,0 +1,15 @@
+﻿
+  Migration name  Batch / Status  
+  0001_01_01_000000_create_users_table  [1] Ran  
+  0001_01_01_000001_create_cache_table  [1] Ran  
+  0001_01_01_000002_create_jobs_table  [1] Ran  
+  2026_02_17_000000_create_bookings_table  [1] Ran  
+  2026_02_28_000001_create_inquiries_table  Pending  
+  2026_02_28_000002_create_rooms_table  Pending  
+  2026_02_28_000003_create_room_inventories_table  Pending  
+  2026_02_28_000004_create_inquiry_quotes_table  Pending  
+  2026_02_28_000005_create_holds_table  Pending  
+  2026_03_04_000001_add_ai_response_to_inquiries_table  Pending  
+  2026_03_04_000002_add_held_rooms_to_room_inventories_table  Pending  
+  2026_03_04_000003_add_unique_room_date_to_room_inventories_table  Pending  
+

@@ -1,0 +1,5 @@
+﻿
+   INFO  Running migrations.  
+
+  2026_03_04_000003_add_unique_room_date_to_room_inventories_table  16.85ms DONE
+

@@ -2,60 +2,98 @@
 
 namespace App\AI\Tools;
 
-use App\Services\GmailService;
+use App\Services\RealGmailService;
+use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Laravel\Ai\Contracts\Tool;
+use Laravel\Ai\Tools\Request;
 use Illuminate\Support\Facades\Log;
-use RuntimeException;
+use Stringable;
 
-class FetchGmailTool
+class FetchGmailTool implements Tool
 {
-    public function __construct(private readonly GmailService $gmailService)
+    public function __construct(private readonly RealGmailService $gmailService)
     {
     }
 
-    /**
-     * @return array{ok: bool, pdf_path?: string}
-     */
-    public function handle(?string $clientName = null): array
+    public function name(): string
     {
-        Log::info('FetchGmailTool.start', [
-            'client_name' => $clientName,
-        ]);
+        return 'fetch_gmail';
+    }
 
-        $clientName = $clientName !== null ? trim($clientName) : null;
-        $safeSubject = $clientName !== null ? str_replace('"', ' ', $clientName) : null;
-        $query = $safeSubject !== null && $safeSubject !== ''
-            ? 'is:unread subject:"' . $safeSubject . '"'
-            : 'is:unread';
+    public function description(): Stringable|string
+    {
+        return 'Fetch the latest unread email from Gmail for a given client. Returns the email body text and an optional PDF attachment path if present. Input: client_name (string, required).';
+    }
 
-        $email = $this->gmailService->fetchLatestEmail([
-            'query' => $query,
-            'pdf_only' => true,
-        ]);
+    public function schema(JsonSchema $schema): array
+    {
+        return [];
+    }
 
-        $attachments = $email['attachments'] ?? [];
-        if (empty($attachments)) {
-            Log::warning('FetchGmailTool.no_pdf_attachment', [
+    public function handle(Request $request): Stringable|string
+    {
+        $clientName = $request['client_name'] ?? null;
+
+        Log::info('FetchGmailTool.start', ['client_name' => $clientName]);
+
+        try {
+            $email = $this->gmailService->fetchLatestEmail([
                 'client_name' => $clientName,
-                'query' => $query,
             ]);
-            throw new RuntimeException('No PDF attachment found in latest Gmail message');
+
+            $rawBody = $email['body_text'] ?? $email['body_html'] ?? '';
+            $subject = $email['subject'] ?? 'No subject';
+            $emailContent = "Subject: " . $subject . "\n\n" . substr($rawBody, 0, 4000);
+
+            $pdfPath = null;
+            $attachments = $email['attachments'] ?? [];
+
+            if (!empty($attachments)) {
+                foreach ($attachments as $attachment) {
+                    if (isset($attachment['type']) && $attachment['type'] === 'pdf') {
+                        $pdfContent = $this->gmailService->downloadAttachment($email['message_id'], $attachment['attachment_id']);
+
+                        $filename = 'gmail_' . $email['message_id'] . '_' . $attachment['filename'];
+                        $pdfPath = storage_path('app/public/uploads/' . $filename);
+
+                        $directory = dirname($pdfPath);
+                        if (!is_dir($directory)) {
+                            mkdir($directory, 0755, true);
+                        }
+
+                        file_put_contents($pdfPath, $pdfContent);
+                        $this->gmailService->markAsRead($email['message_id']);
+                        break;
+                    }
+                }
+            }
+
+            if (!$pdfPath) {
+                $this->gmailService->markAsRead($email['message_id']);
+            }
+
+            Log::info('FetchGmailTool.success', [
+                'client_name' => $clientName,
+                'has_pdf' => $pdfPath !== null,
+                'content_length' => strlen($emailContent),
+            ]);
+
+            return json_encode([
+                'ok' => true,
+                'email_content' => $emailContent,
+                'pdf_path' => $pdfPath,
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('FetchGmailTool.error', [
+                'client_name' => $clientName,
+                'error' => $e->getMessage(),
+            ]);
+
+            return json_encode([
+                'ok' => false,
+                'error' => $e->getMessage(),
+            ]);
         }
-
-        $pdfPath = (string) ($attachments[0]['full_path'] ?? '');
-        if ($pdfPath === '') {
-            throw new RuntimeException('PDF attachment full_path is missing');
-        }
-
-        $result = [
-            'ok' => true,
-            'pdf_path' => $pdfPath,
-        ];
-
-        Log::info('FetchGmailTool.success', [
-            'client_name' => $clientName,
-            'pdf_path' => $pdfPath,
-        ]);
-
-        return $result;
     }
 }

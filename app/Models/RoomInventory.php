@@ -13,6 +13,7 @@ class RoomInventory extends Model
         'total_rooms',
         'booked_rooms',
         'blocked_rooms',
+        'held_rooms',
     ];
 
     protected $casts = [
@@ -26,7 +27,7 @@ class RoomInventory extends Model
 
     public function getAvailableRoomsAttribute(): int
     {
-        return $this->total_rooms - $this->booked_rooms - $this->blocked_rooms;
+        return $this->total_rooms - $this->booked_rooms - $this->blocked_rooms - ($this->held_rooms ?? 0);
     }
 
     public function scopeAvailable($query)
